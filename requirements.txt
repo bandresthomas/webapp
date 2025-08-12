@@ -1,0 +1,6 @@
+nfl_data_py==0.3.3
+pandas>=1.5.3,<2.0
+numpy>=1.26,<2.0
+plotly>=5.22,<7
+streamlit>=1.30,<2
+

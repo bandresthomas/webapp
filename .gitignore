@@ -1,0 +1,39 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# IDEs / Editors
+.vscode/
+.idea/
+
+# Sistema / temporários
+.DS_Store
+Thumbs.db
+
+# Jupyter / Notebooks
+.ipynb_checkpoints
+
+# Streamlit cache
+.streamlit/
+
+# Config locais
+config.toml
+
+# Arquivos sensíveis
+*.env
+secrets.json
