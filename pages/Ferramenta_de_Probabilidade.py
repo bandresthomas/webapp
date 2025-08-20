@@ -126,39 +126,28 @@ def sanitize_player_data(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     # ---- Tier handling ----
-    # 1) Força 'tier' para número (se existir como string, ex.: "Tier 3")
     if "tier" in df.columns:
         df["tier"] = pd.to_numeric(df["tier"], errors="coerce")
     else:
         df["tier"] = np.nan
 
-    # 2) Auto-tier por posição quando faltar: se >50% dos tiers estiver NaN,
-    #    cria N_TIERS grupos por quantil de ADP dentro de cada POS (Tier 1 = melhores ADPs)
+    # Auto-tier por posição quando faltar muitos tiers
     missing_ratio = df["tier"].isna().mean()
     if missing_ratio >= 0.5:
-        N_TIERS = 6  # ajuste conforme preferir
-
+        N_TIERS = 6
         def _assign_tiers_pos(sub: pd.DataFrame) -> pd.DataFrame:
             sub = sub.copy()
-            # Usa rank para evitar problemas de limites duplicados no qcut
             ranks = sub["ADP"].rank(method="first", ascending=True)
             try:
                 labels = list(range(1, N_TIERS + 1))
                 sub["tier"] = pd.qcut(ranks, q=N_TIERS, labels=labels)
             except Exception:
-                # Fallback: poucos jogadores => todos Tier 1
                 sub["tier"] = 1
             sub["tier"] = pd.to_numeric(sub["tier"], errors="coerce")
             return sub
+        df = df.groupby("POS", group_keys=False).apply(_assign_tiers_pos)
 
-        df = (
-            df.groupby("POS", group_keys=False)
-              .apply(_assign_tiers_pos)
-        )
-
-    # Segurança final
     df["tier"] = pd.to_numeric(df["tier"], errors="coerce")
-
     return df
 
 # =============================
@@ -180,15 +169,12 @@ def compute_probabilities(players_df: pd.DataFrame,
     if alive.empty:
         return alive.assign(mu_adj=[], sigma_adj=[], prob_available_next_pick=[])
 
-    # How many picks until user?
     K_user = draft.user_next_pick()
     picks_to_user = max(0, K_user - draft.current_pick)
 
-    # Baseline need per position scaled to picks_to_user
     pos_list = ["QB","RB","WR","TE"]
     need_counts = {p: baseline_rate.get(p, 0.25) * picks_to_user for p in pos_list}
 
-    # Simple run detection on recent picks
     recent = draft.history[-run_window:]
     if len(recent) > 0:
         counts = {p:0 for p in pos_list}
@@ -212,7 +198,6 @@ def compute_probabilities(players_df: pd.DataFrame,
     mu_adj = mu.copy()
     sigma_adj = np.maximum(sig * (1 + chaos), sigma_min)
 
-    # Shift mean earlier for positions with higher expected demand
     demand_by_pos = {p: need_counts.get(p,0.0) for p in pos_list}
     for i in range(len(alive)):
         p = pos[i]
@@ -335,7 +320,7 @@ def compute_card_for_pos(result_df: pd.DataFrame, pos: str, chosen_main: str | N
     else:
         custo_txt = "N/A"
 
-    # Risk missing tier: entre jogadores do mesmo tier do principal (usando dpos, não o board inteiro)
+    # Risk missing tier
     tier1 = j1.get("tier", np.nan)
     if np.isfinite(tier1):
         same_tier = dpos[dpos.get("tier").astype(float) == float(tier1)]
@@ -582,11 +567,10 @@ with col_info:
     }
     render_cards(cards)
 
-    # ==== Tabela com seleção direta ====
+    # ==== Tabela com seleção direta (REFEITA conforme #8) ====
     st.markdown("**Tabela de probabilidades (vivos):**")
 
     filtered_df = result_df.copy()
-    # Reusa o filtro de posições da coluna da esquerda (busca)
     if pos_filter:
         filtered_df = filtered_df[filtered_df["POS"].isin(pos_filter)]
 
@@ -594,17 +578,30 @@ with col_info:
     if show_df.empty:
         st.info("Sem jogadores para exibir com os filtros atuais.")
     else:
+        # Nomes legíveis + arredondamentos
         show_df["ADP"] = pd.to_numeric(show_df["ADP"], errors="coerce").round(1)
-        show_df["imprev"] = pd.to_numeric(show_df["ADP_STD"], errors="coerce").round(2)
-        show_df["ADP_adj"] = pd.to_numeric(show_df["mu_adj"], errors="coerce").round(2)
-        show_df["caos"] = pd.to_numeric(show_df["sigma_adj"], errors="coerce").round(2)
-        # Probability percent safe cast
+        show_df["ADP_STD"] = pd.to_numeric(show_df["ADP_STD"], errors="coerce").round(2)
+        show_df["ADP ajustado"] = pd.to_numeric(show_df["mu_adj"], errors="coerce").round(2)
+        show_df["Desvio ajustado"] = pd.to_numeric(show_df["sigma_adj"], errors="coerce").round(2)
+        show_df["Tier"] = pd.to_numeric(show_df.get("tier"), errors="coerce").astype("Int64")
+        show_df["FPTS"] = pd.to_numeric(show_df.get("FPTS"), errors="coerce")
+
         prob_series = (pd.to_numeric(show_df["prob_available_next_pick"], errors="coerce") * 100).round(0)
         prob_series = prob_series.clip(0, 100).fillna(0).astype(int)
         show_df["Prob próximo pick (%)"] = prob_series
+
+        # Ordenação base por ADP e nome
         show_df = show_df.sort_values(["ADP", "Player"], ascending=[True, True])
-        show_df = show_df[["player_id", "Player", "POS", "ADP", "imprev", "ADP_adj", "caos", "Prob próximo pick (%)"]]
+
+        # ORDEM SOLICITADA (#8)
+        cols_order = [
+            "player_id", "Player", "POS", "Tier", "FPTS", "ADP",
+            "Prob próximo pick (%)", "Selecionar", "ADP_STD", "ADP ajustado", "Desvio ajustado"
+        ]
+        # Garante coluna Selecionar
         show_df["Selecionar"] = False
+
+        show_df = show_df[[c for c in cols_order if c in show_df.columns]]
         show_df = show_df.set_index("player_id", drop=True)
 
         edited = st.data_editor(
@@ -614,10 +611,15 @@ with col_info:
             key="table_editor_right",
             hide_index=True,
             column_config={
+                "ADP": st.column_config.NumberColumn(format="%.1f"),
+                "FPTS": st.column_config.NumberColumn(format="%.1f"),
+                "ADP_STD": st.column_config.NumberColumn(format="%.2f"),
+                "ADP ajustado": st.column_config.NumberColumn(format="%.2f"),
+                "Desvio ajustado": st.column_config.NumberColumn(format="%.2f"),
                 "Prob próximo pick (%)": st.column_config.NumberColumn(format="%d%%"),
                 "Selecionar": st.column_config.CheckboxColumn(help="Marque o jogador que você quer draftar agora"),
             },
-            disabled=["Player", "POS", "ADP", "imprev", "ADP_adj", "caos", "Prob próximo pick (%)"],
+            disabled=["Player", "POS", "Tier", "FPTS", "ADP", "ADP_STD", "ADP ajustado", "Desvio ajustado", "Prob próximo pick (%)"],
         )
 
         col_tbl_btn1, col_tbl_btn2, col_tbl_btn3 = st.columns([1, 1, 1])
@@ -661,7 +663,7 @@ with col_info:
                     draft.history.pop()
                 st.rerun()
 
-        # >>> NOVO BOTÃO: definir como principal do card <<<
+        # >>> Definir como principal do card
         if col_tbl_btn3.button("⭐ Definir como principal do card"):
             sel_rows = edited[edited["Selecionar"] == True] if isinstance(edited, pd.DataFrame) else pd.DataFrame()
             if not sel_rows.empty:
@@ -671,7 +673,6 @@ with col_info:
                 name_sel = str(row["Player"])
                 if "chosen_main_by_pos" not in st.session_state:
                     st.session_state["chosen_main_by_pos"] = {"QB": None, "RB": None, "WR": None, "TE": None}
-                # atualiza o principal da posição
                 if pos_sel in st.session_state["chosen_main_by_pos"]:
                     st.session_state["chosen_main_by_pos"][pos_sel] = name_sel
                 st.rerun()
