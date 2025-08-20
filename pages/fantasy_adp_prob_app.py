@@ -234,15 +234,25 @@ def compute_probabilities(players_df: pd.DataFrame,
 # =============================
 
 def load_players(default_path: str = None, uploaded: bytes = None) -> pd.DataFrame:
+    # 1) Upload do usuário tem prioridade
     if uploaded is not None:
         df = pd.read_csv(uploaded)
-    else:
-        if default_path and os.path.exists(default_path):
+
+    # 2) Caminho padrão: aceita URL (http/https) ou arquivo local
+    elif default_path:
+        if isinstance(default_path, str) and default_path.lower().startswith(("http://", "https://")):
+            df = pd.read_csv(default_path)
+        elif os.path.exists(default_path):
             df = pd.read_csv(default_path)
         else:
-            raise FileNotFoundError("Arquivo de jogadores não encontrado. Forneça o CSV.")
+            raise FileNotFoundError(
+                f"Arquivo de jogadores não encontrado em '{default_path}'. "
+                f"Envie um CSV ou corrija o caminho/URL."
+            )
+    else:
+        raise FileNotFoundError("Arquivo de jogadores não encontrado. Forneça o CSV.")
 
-    # If AVG/adp_std present, map to ADP/ADP_STD
+    # Mapear colunas para ADP/ADP_STD quando necessário
     if "AVG" in df.columns:
         df["ADP"] = pd.to_numeric(df["AVG"], errors="coerce")
     source_cols = [c for c in ["ESPN","Sleeper","NFL","RTSports","FFC","Fantrax"] if c in df.columns]
@@ -256,6 +266,7 @@ def load_players(default_path: str = None, uploaded: bytes = None) -> pd.DataFra
     df = sanitize_player_data(df)
     df["picked"] = False
     return df[["player_id","Player","Team","POS","ADP","ADP_STD","FPTS","tier","picked"]]
+
 
 # =============================
 # ----- Card calc + UI --------
