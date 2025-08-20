@@ -9,6 +9,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from math import erf, sqrt
+import requests
+from datetime import datetime, timezone
+import time
+import re
 
 # =============================
 # ---------- Helpers ----------
@@ -26,6 +30,298 @@ def prob_available_vector(mu: np.ndarray, sigma: np.ndarray, K: int) -> np.ndarr
     z = (K - mu) / sigma_safe
     p = 1.0 - normal_cdf(z)
     return np.clip(p, 0.0, 1.0)
+
+# =============================
+# ---- Sleeper Integration ----
+# =============================
+
+API_BASE = "https://api.sleeper.app/v1"
+HTTP_TIMEOUT_SEC = 6.0
+POLL_SEC_DEFAULT = 5
+PLAYERS_DICT_TTL_SEC = 24 * 3600  # 1 day
+DRAFT_META_TTL_SEC = 120
+PICKS_TTL_SEC = 2
+MAX_BACKOFF_SEC = 60
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _normalize_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    s = name.lower()
+    s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b\.?", "", s)
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _player_key(name: str, pos: str) -> str:
+    return f"{_normalize_name(name)}|{str(pos).upper()}"
+
+
+def sleeper_get(path: str, params: Dict | None = None) -> Dict | List | None:
+    url = f"{API_BASE}{path}"
+    try:
+        resp = requests.get(url, params=params, timeout=HTTP_TIMEOUT_SEC)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=PLAYERS_DICT_TTL_SEC)
+def sleeper_players_dict() -> Dict:
+    data = sleeper_get("/players/nfl")
+    return data if isinstance(data, dict) else {}
+
+
+@st.cache_data(show_spinner=False, ttl=DRAFT_META_TTL_SEC)
+def sleeper_user(username: str) -> Dict | None:
+    if not username:
+        return None
+    return sleeper_get(f"/user/{username}")
+
+
+@st.cache_data(show_spinner=False, ttl=DRAFT_META_TTL_SEC)
+def sleeper_user_leagues(user_id: str, season: str) -> List[Dict]:
+    if not user_id:
+        return []
+    leagues = sleeper_get(f"/user/{user_id}/leagues/nfl/{season}")
+    return leagues if isinstance(leagues, list) else []
+
+
+@st.cache_data(show_spinner=False, ttl=DRAFT_META_TTL_SEC)
+def sleeper_league_drafts(league_id: str) -> List[Dict]:
+    if not league_id:
+        return []
+    drafts = sleeper_get(f"/league/{league_id}/drafts")
+    return drafts if isinstance(drafts, list) else []
+
+
+@st.cache_data(show_spinner=False, ttl=DRAFT_META_TTL_SEC)
+def sleeper_draft_meta(draft_id: str) -> Dict | None:
+    if not draft_id:
+        return None
+    data = sleeper_get(f"/draft/{draft_id}")
+    return data if isinstance(data, dict) else None
+
+
+@st.cache_data(show_spinner=False, ttl=PICKS_TTL_SEC)
+def sleeper_draft_picks(draft_id: str) -> List[Dict]:
+    if not draft_id:
+        return []
+    picks = sleeper_get(f"/draft/{draft_id}/picks")
+    return picks if isinstance(picks, list) else []
+
+
+@st.cache_data(show_spinner=False, ttl=DRAFT_META_TTL_SEC)
+def sleeper_league_rosters(league_id: str) -> List[Dict]:
+    if not league_id:
+        return []
+    rosters = sleeper_get(f"/league/{league_id}/rosters")
+    return rosters if isinstance(rosters, list) else []
+
+
+@st.cache_data(show_spinner=False, ttl=DRAFT_META_TTL_SEC)
+def sleeper_league_users(league_id: str) -> List[Dict]:
+    if not league_id:
+        return []
+    users = sleeper_get(f"/league/{league_id}/users")
+    return users if isinstance(users, list) else []
+
+
+def build_slot_names(draft_id: str, league_id: str | None) -> Dict[int, str]:
+    names: Dict[int, str] = {}
+    if not draft_id or not league_id:
+        return names
+    meta = sleeper_draft_meta(draft_id) or {}
+    slot_to_roster = meta.get("slot_to_roster_id") or meta.get("slot_to_roster_id_map") or {}
+    rosters = sleeper_league_rosters(league_id)
+    users = sleeper_league_users(league_id)
+    roster_id_to_owner: Dict[int, str] = {}
+    for r in rosters:
+        try:
+            roster_id_to_owner[int(r.get("roster_id"))] = str(r.get("owner_id"))
+        except Exception:
+            continue
+    user_id_to_name: Dict[str, str] = {}
+    for u in users:
+        user_id_to_name[str(u.get("user_id"))] = str(u.get("display_name") or u.get("username") or "")
+    for k, v in (slot_to_roster or {}).items():
+        try:
+            slot = int(k)
+            roster_id = int(v)
+            owner_id = roster_id_to_owner.get(roster_id)
+            disp = user_id_to_name.get(str(owner_id)) if owner_id else None
+            if disp:
+                names[slot] = disp
+        except Exception:
+            continue
+    return names
+
+
+def resolve_draft_id_flow(username: str, league_id: str, draft_id: str, season: str) -> Tuple[str | None, str | None]:
+    # Returns (resolved_draft_id, resolved_league_id)
+    if draft_id:
+        return draft_id, league_id or None
+    resolved_league = league_id
+    if not resolved_league and username:
+        u = sleeper_user(username)
+        user_id = u.get("user_id") if isinstance(u, dict) else None
+        leagues = sleeper_user_leagues(user_id, season) if user_id else []
+        if leagues:
+            # Choose the most recently created league
+            leagues_sorted = sorted(leagues, key=lambda x: x.get("created", 0), reverse=True)
+            resolved_league = leagues_sorted[0].get("league_id")
+    if resolved_league:
+        drafts = sleeper_league_drafts(resolved_league)
+        if drafts:
+            # Prefer in_progress or most recent
+            def _draft_score(d):
+                status = str(d.get("status", ""))
+                created = d.get("created", 0)
+                return (1 if status == "in_progress" else 0, created)
+            best = sorted(drafts, key=_draft_score, reverse=True)[0]
+            return best.get("draft_id"), resolved_league
+    return None, resolved_league
+
+
+def get_official_num_teams(draft_id: str, league_id: str | None) -> int | None:
+    meta = sleeper_draft_meta(draft_id) if draft_id else None
+    if isinstance(meta, dict):
+        settings = meta.get("settings") or {}
+        num_teams = settings.get("teams") or settings.get("slots")
+        if isinstance(num_teams, int) and num_teams > 0:
+            return int(num_teams)
+    if league_id:
+        league = sleeper_get(f"/league/{league_id}")
+        if isinstance(league, dict):
+            settings = league.get("settings") or {}
+            num_teams = settings.get("num_teams") or settings.get("teams")
+            if isinstance(num_teams, int) and num_teams > 0:
+                return int(num_teams)
+    # Fallback: infer from picks
+    if draft_id:
+        picks = sleeper_draft_picks(draft_id)
+        slots = [p.get("draft_slot") for p in picks if isinstance(p, dict) and p.get("draft_slot")]
+        if slots:
+            return int(max(slots))
+    return None
+
+
+def build_local_lookup(players_df: pd.DataFrame) -> Dict[str, str]:
+    # Map normalized name + pos => local player_id
+    lookup: Dict[str, str] = {}
+    for _, row in players_df.iterrows():
+        name = str(row.get("Player", ""))
+        pos = str(row.get("POS", "")).upper()
+        pid = str(row.get("player_id", ""))
+        key = _player_key(name, pos)
+        if key and pid:
+            lookup[key] = pid
+    return lookup
+
+
+def try_match_sleeper_to_local(sp: Dict, lookup: Dict[str, str], players_df: pd.DataFrame) -> str | None:
+    # sp keys: player_id, metadata including full_name/team/position
+    full_name = sp.get("metadata", {}).get("full_name") or sp.get("player_name") or ""
+    position = (sp.get("metadata", {}).get("position") or sp.get("position") or "").upper()
+    key = _player_key(full_name, position)
+    pid = lookup.get(key)
+    if pid:
+        return pid
+    # Fallback: try last name + pos if unique
+    name_norm = _normalize_name(full_name)
+    last = name_norm.split(" ")[-1] if name_norm else ""
+    if last:
+        candidates = players_df[players_df["POS"].str.upper() == position]
+        candidates = candidates[candidates["Player"].str.lower().str.contains(last, na=False)]
+        if len(candidates) == 1:
+            return str(candidates.iloc[0]["player_id"])
+    return None
+
+
+def apply_sleeper_sync(players_df: pd.DataFrame, draft: 'DraftState', picks: List[Dict], manual_map: Dict[str, str]) -> Tuple[pd.DataFrame, 'DraftState', List[Tuple[str, str, str]]]:
+    # Returns updated (players_df, draft, unresolved_list[(sleeper_id, name, pos)])
+    df = players_df.copy()
+    if df.empty:
+        return df, draft, []
+    df["picked"] = False
+
+    lookup = build_local_lookup(df)
+    # Direct mapping via sleeper_id column when available
+    sid_to_local: Dict[str, str] = {}
+    if "sleeper_id" in df.columns:
+        try:
+            sid_series = df["sleeper_id"].astype(str).str.strip()
+            for local_pid, sid in zip(df["player_id"], sid_series):
+                if sid and sid.lower() != "nan":
+                    sid_to_local[str(sid)] = str(local_pid)
+        except Exception:
+            sid_to_local = {}
+    unresolved: List[Tuple[str, str, str]] = []
+
+    # Prepare teams structure from picks
+    teams_map: Dict[int, List[Tuple[str, str]]] = {}
+    history: List[Tuple[int, str, str]] = []
+
+    for idx, p in enumerate(sorted(picks, key=lambda x: (x.get("round", 0), x.get("pick", 0), x.get("overall", 0)))):
+        sleeper_pid = str(p.get("player_id", ""))
+        meta = p.get("metadata", {}) if isinstance(p.get("metadata"), dict) else {}
+        full_name = meta.get("full_name") or p.get("player_name") or ""
+        position = (meta.get("position") or p.get("position") or "").upper()
+        draft_slot = int(p.get("draft_slot", 0) or 0)
+
+        if position not in {"QB", "RB", "WR", "TE"}:
+            continue
+
+        # Priority 1: manual override
+        local_pid = manual_map.get(sleeper_pid)
+        # Priority 2: direct sleeper_id column mapping
+        if not local_pid and sleeper_pid and sid_to_local:
+            local_pid = sid_to_local.get(sleeper_pid)
+        # Priority 3: heuristic matching
+        if not local_pid:
+            local_pid = try_match_sleeper_to_local(p, lookup, df)
+
+        if local_pid and (df["player_id"] == local_pid).any():
+            # mark picked
+            df.loc[df["player_id"] == local_pid, "picked"] = True
+            row = df.loc[df["player_id"] == local_pid].iloc[0]
+            history.append((len(history) + 1, local_pid, str(row["POS"])) )
+            if draft_slot not in teams_map:
+                teams_map[draft_slot] = []
+            teams_map[draft_slot].append((str(row["Player"]), str(row["POS"])) )
+        else:
+            unresolved.append((sleeper_pid, str(full_name), str(position)))
+
+    # Rebuild draft teams in slot order
+    if isinstance(draft.N, int) and draft.N > 0:
+        max_slot = max([0] + list(teams_map.keys()))
+        num_teams = max(draft.N, max_slot)
+    else:
+        num_teams = max([0] + list(teams_map.keys()))
+    teams: List[TeamState] = [TeamState() for _ in range(max(1, num_teams))]
+    for slot, plist in teams_map.items():
+        if 1 <= slot <= len(teams):
+            teams[slot - 1].players = plist.copy()
+            # recompute taken counts
+            taken = {"QB": 0, "RB": 0, "WR": 0, "TE": 0}
+            for _, pos in plist:
+                if pos in taken:
+                    taken[pos] += 1
+            teams[slot - 1].taken = taken
+
+    draft.teams = teams
+    draft.history = history
+    draft.current_pick = len(history) + 1
+    draft.N = len(teams)
+
+    return df, draft, unresolved
 
 # =============================
 # ---------- Draft Types ------
@@ -118,6 +414,10 @@ def sanitize_player_data(df: pd.DataFrame) -> pd.DataFrame:
         df["FPTS"] = np.nan  # optional
     if "tier" not in df.columns:
         df["tier"] = np.nan  # optional
+
+    # Optional: sleeper_id for direct mapping to Sleeper API
+    if "sleeper_id" in df.columns:
+        df["sleeper_id"] = df["sleeper_id"].astype(str).str.strip()
 
     if "player_id" not in df.columns:
         df["player_id"] = (
@@ -250,7 +550,10 @@ def load_players(default_path: str = None, uploaded: bytes = None) -> pd.DataFra
 
     df = sanitize_player_data(df)
     df["picked"] = False
-    return df[["player_id","Player","Team","POS","ADP","ADP_STD","FPTS","tier","picked"]]
+    base_cols = ["player_id","Player","Team","POS","ADP","ADP_STD","FPTS","tier","picked"]
+    if "sleeper_id" in df.columns:
+        base_cols.insert(1, "sleeper_id")  # keep close to ids
+    return df[[c for c in base_cols if c in df.columns]]
 
 
 # =============================
@@ -396,6 +699,66 @@ with st.sidebar:
     st.caption(f"Caminho padrão: {default_path}")
     uploaded = st.file_uploader("Ou envie o CSV aqui", type=["csv"])  # opcional
 
+    st.markdown("---")
+    st.header("Integração Sleeper")
+    if "sleeper" not in st.session_state:
+        st.session_state["sleeper"] = {
+            "enabled": False,
+            "paused": False,
+            "username": "",
+            "league_id": "",
+            "draft_id": "",
+            "season": str(datetime.now().year),
+            "poll_sec": POLL_SEC_DEFAULT,
+            "last_sync_ts": 0.0,
+            "last_error_ts": 0.0,
+            "backoff_sec": 0,
+            "status": "idle",
+            "logs": [],
+            "manual_map": {},  # sleeper_player_id -> local player_id
+            "unresolved": [],  # list of tuples (sleeper_id, name, pos)
+        }
+
+    sleeper_state = st.session_state["sleeper"]
+
+    sleeper_state["enabled"] = st.checkbox("Habilitar sync com Sleeper", value=sleeper_state.get("enabled", False))
+    sleeper_state["paused"] = st.checkbox("Pausar sincronização", value=sleeper_state.get("paused", False), disabled=not sleeper_state["enabled"]) if sleeper_state["enabled"] else sleeper_state["paused"]
+
+    sleeper_state["username"] = st.text_input("Sleeper username (opcional)", value=sleeper_state.get("username", ""))
+    col_sid1, col_sid2 = st.columns(2)
+    with col_sid1:
+        sleeper_state["league_id"] = st.text_input("league_id (opcional)", value=sleeper_state.get("league_id", ""))
+    with col_sid2:
+        sleeper_state["draft_id"] = st.text_input("draft_id (opcional)", value=sleeper_state.get("draft_id", ""))
+    col_season, col_poll = st.columns(2)
+    with col_season:
+        sleeper_state["season"] = st.text_input("Season", value=sleeper_state.get("season", str(datetime.now().year)))
+    with col_poll:
+        sleeper_state["poll_sec"] = int(st.slider("Polling (s)", 3, 20, sleeper_state.get("poll_sec", POLL_SEC_DEFAULT), 1))
+
+    col_btns1, col_btns2, col_btns3 = st.columns(3)
+    if col_btns1.button("Resolver Draft ID") and sleeper_state["enabled"]:
+        rid, rleague = resolve_draft_id_flow(sleeper_state.get("username", ""), sleeper_state.get("league_id", ""), sleeper_state.get("draft_id", ""), sleeper_state.get("season", str(datetime.now().year)))
+        if rid:
+            sleeper_state["draft_id"] = rid
+            if rleague:
+                sleeper_state["league_id"] = rleague
+            sleeper_state["status"] = f"Conectado ao draft_id {rid}"
+            sleeper_state["logs"].append(f"[{_now_utc_iso()}] Resolved draft_id={rid} league_id={rleague}")
+        else:
+            sleeper_state["status"] = "Não foi possível resolver o draft"
+            sleeper_state["logs"].append(f"[{_now_utc_iso()}] Falha ao resolver draft")
+
+    if col_btns2.button("Sync agora") and sleeper_state["enabled"]:
+        sleeper_state["last_sync_ts"] = 0.0  # force immediate sync in main loop
+        sleeper_state["last_error_ts"] = 0.0
+        sleeper_state["backoff_sec"] = 0
+        st.rerun()
+
+    if col_btns3.button("Limpar mapeamentos"):
+        sleeper_state["manual_map"] = {}
+        sleeper_state["logs"].append(f"[{_now_utc_iso()}] Limpei mapeamentos manuais")
+
 # ---------- Init/Load Data ----------
 if "players_df" not in st.session_state:
     try:
@@ -418,6 +781,53 @@ if uploaded is not None and st.session_state.get("_uploaded_sha") != hash(upload
 
 players_df = st.session_state.players_df
 
+## Background sync moved below after draft initialization
+
+# Status/Logs panel
+with st.expander("Status & Logs — Sleeper"):
+    s = st.session_state.get("sleeper", {})
+    if s.get("enabled"):
+        st.write({
+            "status": s.get("status"),
+            "draft_id": s.get("draft_id"),
+            "league_id": s.get("league_id"),
+            "paused": s.get("paused"),
+            "poll_sec": s.get("poll_sec"),
+            "backoff_sec": s.get("backoff_sec"),
+            "last_sync_ts": s.get("last_sync_ts"),
+            "unresolved": len(s.get("unresolved", [])),
+        })
+        if s.get("unresolved"):
+            st.markdown("Jogadores não mapeados do Sleeper:")
+            df_unr = pd.DataFrame(s.get("unresolved"), columns=["sleeper_id", "name", "pos"]) if isinstance(s.get("unresolved"), list) else pd.DataFrame()
+            if not df_unr.empty:
+                st.dataframe(df_unr, use_container_width=True)
+                # Mapping UI
+                col_map1, col_map2 = st.columns([2, 3])
+                with col_map1:
+                    sel_unr = st.selectbox("Selecionar sleeper_id p/ mapear", df_unr["sleeper_id"].tolist())
+                with col_map2:
+                    # Suggest candidates by position
+                    pos_mask = players_df["POS"].isin(df_unr.loc[df_unr["sleeper_id"] == sel_unr, "pos"].tolist())
+                    candidates = players_df.loc[~players_df["picked"] & pos_mask, ["player_id", "Player", "POS", "Team", "ADP"]].copy()
+                    candidates.sort_values(["ADP", "Player"], inplace=True)
+                    options = candidates.apply(lambda r: f"{r['Player']} ({r['POS']}-{r['Team']}) • ADP {int(r['ADP']) if pd.notna(r['ADP']) else '-'}", axis=1).tolist()
+                    ids = candidates["player_id"].tolist()
+                    map_choice = st.selectbox("Mapear para jogador local", options)
+                    if st.button("Salvar mapeamento"):
+                        if map_choice and ids and options:
+                            pid = ids[options.index(map_choice)] if map_choice in options else None
+                            if pid:
+                                st.session_state["sleeper"]["manual_map"][str(sel_unr)] = str(pid)
+                                st.session_state["sleeper"]["logs"].append(f"[{_now_utc_iso()}] Mapeei sleeper {sel_unr} -> {pid}")
+                                # Trigger resync soon
+                                st.session_state["sleeper"]["last_sync_ts"] = 0.0
+                                st.rerun()
+        st.markdown("Logs:")
+        for line in list(s.get("logs", []))[-200:]:
+            st.code(line)
+    else:
+        st.write("Integração desabilitada.")
 # ---------- Initialize Draft State ----------
 if "draft" not in st.session_state or st.session_state.draft.N != N or st.session_state.draft.user_slot != user_slot:
     teams = [TeamState() for _ in range(int(N))]
@@ -426,6 +836,59 @@ if "draft" not in st.session_state or st.session_state.draft.N != N or st.sessio
     st.session_state.pick_log = []  # for undo
 
 draft = st.session_state.draft
+
+# ---------- Sleeper: Background Sync (after draft init) ----------
+if st.session_state.get("sleeper", {}).get("enabled"):
+    sleeper_state = st.session_state["sleeper"]
+
+    if not sleeper_state.get("draft_id"):
+        rid, rleague = resolve_draft_id_flow(sleeper_state.get("username", ""), sleeper_state.get("league_id", ""), None, sleeper_state.get("season", str(datetime.now().year)))
+        if rid:
+            sleeper_state["draft_id"] = rid
+            if rleague:
+                sleeper_state["league_id"] = rleague
+            sleeper_state["logs"].append(f"[{_now_utc_iso()}] Auto-resolve draft_id={rid} league_id={rleague}")
+
+    if sleeper_state.get("draft_id"):
+        official_N = get_official_num_teams(sleeper_state["draft_id"], sleeper_state.get("league_id"))
+        if isinstance(official_N, int) and official_N > 0 and official_N != st.session_state.draft.N:
+            st.session_state.draft.N = int(official_N)
+            # If N changed, ensure teams size matches
+            if len(st.session_state.draft.teams) != int(official_N):
+                st.session_state.draft.teams = [TeamState() for _ in range(int(official_N))]
+
+    now_ts = time.time()
+    due = (now_ts - sleeper_state.get("last_sync_ts", 0)) >= max(1, sleeper_state.get("poll_sec", POLL_SEC_DEFAULT))
+    blocked_by_backoff = (now_ts - sleeper_state.get("last_error_ts", 0)) < sleeper_state.get("backoff_sec", 0)
+
+    if not sleeper_state.get("paused", False) and sleeper_state.get("draft_id") and due and not blocked_by_backoff:
+        try:
+            picks = sleeper_draft_picks(sleeper_state["draft_id"])
+            if isinstance(picks, list):
+                new_df, new_draft, unresolved = apply_sleeper_sync(players_df, st.session_state.draft, picks, sleeper_state.get("manual_map", {}))
+                st.session_state.players_df = new_df
+                st.session_state.draft = new_draft
+                players_df = new_df
+                draft = new_draft
+                sleeper_state["unresolved"] = unresolved
+                sleeper_state["status"] = f"OK: {len(new_draft.history)} picks sincronizados"
+                sleeper_state["logs"].append(f"[{_now_utc_iso()}] Sync ok: {len(new_draft.history)} picks; unresolved={len(unresolved)}")
+                sleeper_state["last_sync_ts"] = now_ts
+                sleeper_state["backoff_sec"] = 0
+            else:
+                raise RuntimeError("Resposta inválida da API de picks")
+        except Exception as e:
+            sleeper_state["status"] = f"Erro: {e}"
+            sleeper_state["logs"].append(f"[{_now_utc_iso()}] Erro ao sync: {e}")
+            sleeper_state["last_error_ts"] = now_ts
+            new_backoff = sleeper_state.get("backoff_sec", 0) * 2 if sleeper_state.get("backoff_sec", 0) else sleeper_state.get("poll_sec", POLL_SEC_DEFAULT)
+            sleeper_state["backoff_sec"] = int(min(MAX_BACKOFF_SEC, max(3, new_backoff)))
+
+    if sleeper_state.get("enabled") and not sleeper_state.get("paused"):
+        try:
+            st.autorefresh(interval=int(max(3, sleeper_state.get("poll_sec", POLL_SEC_DEFAULT)) * 1000), key="sleeper_autorefresh")
+        except Exception:
+            pass
 
 # ---------- Controls: Draft Picks (busca rápida) ----------
 col_pick, col_info = st.columns([1, 2])
@@ -471,7 +934,10 @@ with col_pick:
     selected_label = st.selectbox("Selecionar (busca rápida)", list(label_to_id.keys()) if len(label_to_id) > 0 else ["Sem opções"])
 
     col_btn1, col_btn2 = st.columns(2)
-    if col_btn1.button("✅ Draftar (busca)") and selected_label in label_to_id:
+    sleeper_active = st.session_state.get("sleeper", {}).get("enabled") and not st.session_state.get("sleeper", {}).get("paused", False)
+    if sleeper_active:
+        st.caption("Draft manual desabilitado enquanto o sync do Sleeper está ativo. Pause o sync para draftar manualmente.")
+    if col_btn1.button("✅ Draftar (busca)", disabled=bool(sleeper_active)) and selected_label in label_to_id:
         pid = label_to_id[selected_label]
         row = players_df.loc[players_df["player_id"] == pid].iloc[0]
         players_df.loc[players_df["player_id"] == pid, "picked"] = True
@@ -482,7 +948,7 @@ with col_pick:
         draft.current_pick += 1
         st.rerun()
 
-    if col_btn2.button("↩️ Desfazer última pick"):
+    if col_btn2.button("↩️ Desfazer última pick", disabled=bool(sleeper_active)):
         if st.session_state.pick_log:
             last_pid = st.session_state.pick_log.pop()
             draft.current_pick = max(1, draft.current_pick - 1)
@@ -624,7 +1090,7 @@ with col_info:
 
         col_tbl_btn1, col_tbl_btn2, col_tbl_btn3 = st.columns([1, 1, 1])
 
-        if col_tbl_btn1.button("✅ Draftar selecionado (tabela)"):
+        if col_tbl_btn1.button("✅ Draftar selecionado (tabela)", disabled=bool(sleeper_active)):
             sel_rows = edited[edited["Selecionar"] == True] if isinstance(edited, pd.DataFrame) else pd.DataFrame()
             if not sel_rows.empty:
                 pid = sel_rows.index[0]
@@ -642,7 +1108,7 @@ with col_info:
                 draft.current_pick += 1
                 st.rerun()
 
-        if col_tbl_btn2.button("↩️ Desfazer (tabela)"):
+        if col_tbl_btn2.button("↩️ Desfazer (tabela)", disabled=bool(sleeper_active)):
             if st.session_state.pick_log:
                 last_pid = st.session_state.pick_log.pop()
                 draft.current_pick = max(1, draft.current_pick - 1)
@@ -686,9 +1152,18 @@ rounds_completed = ((max_picks) // draft.N) + (1 if (max_picks % draft.N) else 0
 rounds_to_show = max(8, rounds_completed + 1)
 
 cols_board = st.columns(int(draft.N))
+# Build slot names once
+slot_names = {}
+sstate = st.session_state.get("sleeper", {})
+if sstate.get("enabled") and sstate.get("league_id") and sstate.get("draft_id"):
+    try:
+        slot_names = build_slot_names(sstate.get("draft_id"), sstate.get("league_id"))
+    except Exception:
+        slot_names = {}
 for i in range(int(draft.N)):
     with cols_board[i]:
-        st.markdown(f"**Time {i+1}**")
+        title = slot_names.get(i+1) or f"Time {i+1}"
+        st.markdown(f"**{title}**")
         team_players = draft.teams[i].players
         for r in range(rounds_to_show):
             if r < len(team_players):

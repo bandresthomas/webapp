@@ -181,4 +181,57 @@
 
 ---
 
+## 📌 Atualização de Integração Sleeper e Mapeamento
 
+### ✅ O que foi feito
+- **Integração Sleeper (completa):**  
+  - Controles na sidebar.  
+  - Resolução automática de `draft_id`.  
+  - Polling com backoff exponencial + `autorefresh`.  
+  - Bloqueio de picks manuais quando o sync está ativo.  
+  - Draft board reconstruído com nomes reais dos donos.  
+  - Status/logs expandidos, incluindo painel de mapeamento manual para jogadores “unresolved”.
+
+- **Correção de Cache:**  
+  - Removido `@st.cache_data` da função HTTP base (`sleeper_get`).  
+  - Mantido cache apenas nas funções finais:  
+    - Players → 24h  
+    - Meta/League → 120s  
+    - Picks → 2s  
+  - Corrige problema onde `/draft/{id}/picks` ficava preso em `[]`.
+
+- **Botão “Sync agora”:**  
+  - Agora zera `last_sync_ts`, `last_error_ts` e `backoff_sec`.  
+  - Garante execução imediata da sincronização.
+
+- **CSV com `sleeper_id`:**  
+  - App lê `sleeper_id` diretamente do CSV (`adp_app_table.csv`).  
+  - Ordem de mapeamento ao sincronizar:  
+    1. Manual (`manual_map` via CSV de usuário)  
+    2. Diretamente por `sleeper_id` do CSV base  
+    3. Heurística (nome/posição/time)  
+  - Redução significativa dos casos de “unresolved”.
+
+- **Script de enriquecimento (`auxiliar/map_sleeper_ids.py`):**  
+  - Faz download da API `https://api.sleeper.app/v1/players/nfl`.  
+  - Cruza com `adp_app_table.csv`.  
+  - Gera:  
+    - `adp_app_table_with_sleeper.csv` (coluna `sleeper_id` preenchida quando encontrado)  
+    - `adp_unmatched.csv` (jogadores não encontrados, para mapeamento manual).
+
+### 🐞 Problemas encontrados e soluções
+- **Problema:** Picks não atualizavam, mesmo com API retornando dados.  
+  **Causa:** cache global de 24h em `sleeper_get` segurava resposta inicial vazia.  
+  **Solução:** remover cache da função base, manter TTLs diferentes por função final.
+
+- **Problema:** Jogadores apareciam sempre como “não mapeados”.  
+  **Causa:** Falta de `sleeper_id` no CSV e diferenças de nomes.  
+  **Solução:** incluir `sleeper_id` no CSV + lógica de fallback em três camadas (manual, direto, heurística).
+
+- **Problema:** Usuário não tinha forma prática de resolver casos “unresolved”.  
+  **Solução:** gerar planilha (`adp_unmatched.csv` ou `.xlsx`) com colunas `sleeper_id, player_id`, e adicionar uploader no app para importar correções.
+
+### 🎯 Resultado / Aceite
+- Painel exibe “OK: N picks sincronizados” (N>0 quando a API tem picks).  
+- Board e jogadores refletem o draft oficial do Sleeper em tempo quase real.  
+- Funcionalidades antigas (cards, tabela, probabilidades) preservadas.  
