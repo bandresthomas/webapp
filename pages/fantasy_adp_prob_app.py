@@ -1,3 +1,5 @@
+# fantasy_adp_prob_app.py
+
 import os
 import math
 from dataclasses import dataclass, field
@@ -18,14 +20,12 @@ def normal_cdf(z):
     erf_vec = np.vectorize(erf)
     return 0.5 * (1.0 + erf_vec(z_arr / np.sqrt(2.0)))
 
-
 def prob_available_vector(mu: np.ndarray, sigma: np.ndarray, K: int) -> np.ndarray:
     """P(X > K) for X ~ N(mu, sigma^2). Clipped to [0,1]. Safe for arrays."""
     sigma_safe = np.where(~np.isfinite(sigma) | (sigma <= 0), 1.0, sigma)
     z = (K - mu) / sigma_safe
     p = 1.0 - normal_cdf(z)
     return np.clip(p, 0.0, 1.0)
-
 
 # =============================
 # ---------- Draft Types ------
@@ -68,7 +68,6 @@ class DraftState:
     def user_next_pick(self) -> int:
         return self.next_pick_for_slot(self.user_slot, self.current_pick)
 
-
 # =============================
 # -------- Data Hygiene -------
 # =============================
@@ -92,7 +91,7 @@ def sanitize_player_data(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # If ADP missing but sources exist, compute
-    source_cols = [c for c in ["ESPN","Sleeper","NFL","RTSports","FFC","Fantrax"] if c in df.columns]
+    source_cols = [c for c in ["ESPN", "Sleeper", "NFL", "RTSports", "FFC", "Fantrax"] if c in df.columns]
     for c in source_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     if "ADP" not in df.columns and source_cols:
@@ -101,7 +100,7 @@ def sanitize_player_data(df: pd.DataFrame) -> pd.DataFrame:
         df["ADP_STD"] = df[source_cols].std(axis=1, ddof=0, skipna=True)
 
     # Remove non-finite ADP/STD
-    for c in ["ADP","ADP_STD"]:
+    for c in ["ADP", "ADP_STD"]:
         if c in df.columns:
             df[c] = df[c].replace([np.inf, -np.inf], np.nan)
     df = df[df["ADP"].notna() & df["ADP_STD"].notna()]
@@ -126,8 +125,41 @@ def sanitize_player_data(df: pd.DataFrame) -> pd.DataFrame:
             + "_" + df["Team"].astype(str).str.lower()
         )
 
-    return df
+    # ---- Tier handling ----
+    # 1) Força 'tier' para número (se existir como string, ex.: "Tier 3")
+    if "tier" in df.columns:
+        df["tier"] = pd.to_numeric(df["tier"], errors="coerce")
+    else:
+        df["tier"] = np.nan
 
+    # 2) Auto-tier por posição quando faltar: se >50% dos tiers estiver NaN,
+    #    cria N_TIERS grupos por quantil de ADP dentro de cada POS (Tier 1 = melhores ADPs)
+    missing_ratio = df["tier"].isna().mean()
+    if missing_ratio >= 0.5:
+        N_TIERS = 6  # ajuste conforme preferir
+
+        def _assign_tiers_pos(sub: pd.DataFrame) -> pd.DataFrame:
+            sub = sub.copy()
+            # Usa rank para evitar problemas de limites duplicados no qcut
+            ranks = sub["ADP"].rank(method="first", ascending=True)
+            try:
+                labels = list(range(1, N_TIERS + 1))
+                sub["tier"] = pd.qcut(ranks, q=N_TIERS, labels=labels)
+            except Exception:
+                # Fallback: poucos jogadores => todos Tier 1
+                sub["tier"] = 1
+            sub["tier"] = pd.to_numeric(sub["tier"], errors="coerce")
+            return sub
+
+        df = (
+            df.groupby("POS", group_keys=False)
+              .apply(_assign_tiers_pos)
+        )
+
+    # Segurança final
+    df["tier"] = pd.to_numeric(df["tier"], errors="coerce")
+
+    return df
 
 # =============================
 # ------- Core Calculator -----
@@ -142,11 +174,7 @@ def compute_probabilities(players_df: pd.DataFrame,
                           baseline_rate: Dict[str, float] = {"RB": 0.33, "WR": 0.42, "QB": 0.13, "TE": 0.12},
                           tau_hot: float = 3.0,
                           run_z_threshold: float = 1.0) -> pd.DataFrame:
-    """Simplified, robust probability computation.
-    - Filters invalid rows
-    - Light run detection inflates variance for hot positions
-    - Needs estimate: counts how many picks before user and distributes by baseline
-    """
+    """Simplified, robust probability computation."""
     alive = players_df.loc[~players_df["picked"].astype(bool)].copy()
     alive = alive[np.isfinite(alive["ADP"]) & np.isfinite(alive["ADP_STD"])]
     if alive.empty:
@@ -168,7 +196,12 @@ def compute_probabilities(players_df: pd.DataFrame,
             if p in counts:
                 counts[p]+=1
         n = len(recent)
-        hot = {p: ((counts[p] - baseline_rate.get(p,0)*n) / max(1e-6, math.sqrt(n*baseline_rate.get(p,0)*(1-baseline_rate.get(p,0))+1e-6)) >= run_z_threshold) for p in pos_list}
+        hot = {}
+        for p in pos_list:
+            base = baseline_rate.get(p, 0.0)
+            var = n*base*(1-base)+1e-6
+            z = (counts[p] - base*n)/math.sqrt(var)
+            hot[p] = z >= run_z_threshold
     else:
         hot = {p: False for p in pos_list}
 
@@ -195,7 +228,6 @@ def compute_probabilities(players_df: pd.DataFrame,
     out["sigma_adj"] = sigma_adj
     out["prob_available_next_pick"] = probs
     return out
-
 
 # =============================
 # --------- Data Loading ------
@@ -225,54 +257,54 @@ def load_players(default_path: str = None, uploaded: bytes = None) -> pd.DataFra
     df["picked"] = False
     return df[["player_id","Player","Team","POS","ADP","ADP_STD","FPTS","tier","picked"]]
 
-
 # =============================
 # ----- Card calc + UI --------
 # =============================
 
-def compute_card_for_pos(result_df: pd.DataFrame, pos: str) -> Dict[str, str]:
+def compute_card_for_pos(result_df: pd.DataFrame, pos: str, chosen_main: str | None = None) -> Dict[str, str]:
+    """
+    Calcula os campos do card para uma POS específica usando result_df (já com probas).
+    - chosen_main: se fornecido, usa este jogador como principal (se existir na posição).
+    - 'Próximo' = primeiro com P(sobrar) >= 50% (fallback: próximo da lista).
+    """
     dpos = result_df[result_df["POS"] == pos].copy()
     if dpos.empty:
         return {"main":"—","psobrar":"—","fpts1":"—","next_name":"—","fpts2":"—","custo":"—","risk":"—"}
 
-    # Choose top by FPTS when available, else by ADP asc
+    # Ordenação base: FPTS desc quando houver; senão ADP asc
     if "FPTS" in dpos.columns and dpos["FPTS"].notna().any():
         dpos = dpos.sort_values(["FPTS","ADP"], ascending=[False, True])
     else:
         dpos = dpos.sort_values(["ADP","Player"], ascending=[True, True])
 
-    j1 = dpos.iloc[0]
-    name1 = str(j1["Player"])  # full name
+    # Principal: escolhido ou default top
+    if chosen_main and chosen_main in dpos["Player"].values:
+        j1 = dpos.loc[dpos["Player"] == chosen_main].iloc[0]
+    else:
+        j1 = dpos.iloc[0]
+
+    name1 = str(j1["Player"])
     p1 = float(j1.get("prob_available_next_pick", np.nan))
     fpts1 = float(j1.get("FPTS", np.nan))
 
-    # próximo melhor (exige P(sobrar) >= 50%); se não houver, usa fallback do próximo da lista
+    # Próximo = primeiro por ADP com P(sobrar) >= 50% (pode ser o próprio principal)
     next_thresh = 0.50
-    if len(dpos) > 1:
-        dpos_rest = dpos.iloc[1:].copy()
-        # coluna de prob pode não existir/vir NaN; normaliza
-        if "prob_available_next_pick" in dpos_rest.columns:
-            dpos_rest["p_next"] = pd.to_numeric(dpos_rest["prob_available_next_pick"], errors="coerce").fillna(0.0)
-        else:
-            dpos_rest["p_next"] = 0.0
+    dpos_adp = dpos.sort_values(["ADP", "Player"], ascending=[True, True]).copy()
 
-        cands = dpos_rest[dpos_rest["p_next"] >= next_thresh]
-        if not cands.empty:
-            if "FPTS" in cands.columns and cands["FPTS"].notna().any():
-                cands = cands.sort_values(["FPTS", "ADP"], ascending=[False, True])
-            else:
-                cands = cands.sort_values(["ADP", "Player"], ascending=[True, True])
-            j2 = cands.iloc[0]
-        else:
-            # fallback: usa o próximo da lista original
-            j2 = dpos_rest.iloc[0]
-        fpts2 = float(j2["FPTS"]) if "FPTS" in dpos.columns and pd.notna(j2["FPTS"]) else (fpts1 if np.isfinite(fpts1) else np.nan)
-        name2 = str(j2["Player"])  # nome completo
+    if "prob_available_next_pick" in dpos_adp.columns:
+        dpos_adp["p_next"] = pd.to_numeric(dpos_adp["prob_available_next_pick"], errors="coerce").fillna(0.0)
     else:
-        j2 = None
-        fpts2 = 0.0 if np.isfinite(fpts1) else np.nan
-        name2 = "—"
+        dpos_adp["p_next"] = 0.0
 
+    cands = dpos_adp[dpos_adp["p_next"] >= next_thresh]
+
+    if not cands.empty:
+        j2 = cands.iloc[0]  # primeiro por ADP com P>=50%
+    else:
+        j2 = dpos_adp.iloc[0]  # fallback: primeiro por ADP
+
+    name2 = str(j2["Player"])
+    fpts2 = float(j2.get("FPTS", np.nan)) if np.isfinite(j2.get("FPTS", np.nan)) else (fpts1 if np.isfinite(fpts1) else np.nan)
 
     # Formats
     if np.isfinite(p1):
@@ -284,7 +316,7 @@ def compute_card_for_pos(result_df: pd.DataFrame, pos: str) -> Dict[str, str]:
     fpts1_txt = f"{fpts1:.1f}" if np.isfinite(fpts1) else "N/A"
     fpts2_txt = f"{fpts2:.1f}" if np.isfinite(fpts2) else "N/A"
 
-    # EV if pass ≈ p1*FPTS1 + (1-p1)*FPTS2
+    # EV if pass ≈ p1*FPTS1 + (1-p1)*FPTS2  (usa p1 do principal)
     if np.isfinite(p1) and np.isfinite(fpts1) and np.isfinite(fpts2):
         ev_pass = p1*fpts1 + (1-p1)*fpts2
         custo = fpts1 - ev_pass
@@ -292,7 +324,7 @@ def compute_card_for_pos(result_df: pd.DataFrame, pos: str) -> Dict[str, str]:
     else:
         custo_txt = "N/A"
 
-    # Risk missing tier: among same tier as j1
+    # Risk missing tier: entre jogadores do mesmo tier do principal (usando dpos, não o board inteiro)
     tier1 = j1.get("tier", np.nan)
     if np.isfinite(tier1):
         same_tier = dpos[dpos.get("tier").astype(float) == float(tier1)]
@@ -306,7 +338,6 @@ def compute_card_for_pos(result_df: pd.DataFrame, pos: str) -> Dict[str, str]:
         risk_txt = "N/A"
 
     return {"main":name1, "psobrar":psobrar_txt, "fpts1":fpts1_txt, "next_name":name2, "fpts2":fpts2_txt, "custo":custo_txt, "risk":risk_txt}
-
 
 def render_cards(cards: Dict[str, Dict[str, str]]):
     st.markdown(
@@ -342,13 +373,11 @@ def render_cards(cards: Dict[str, Dict[str, str]]):
             </div>
             """, unsafe_allow_html=True)
 
-
 # =============================
 # ------------- UI ------------
 # =============================
 
 st.set_page_config(page_title="ADP Prob Draft", layout="wide")
-
 st.title("🔮 Probabilidade de Jogador Disponível — Draft NFL (com runs e necessidades)")
 
 # ---------- Sidebar Controls ----------
@@ -492,15 +521,61 @@ with col_info:
         tau_hot=tau_hot,
         run_z_threshold=run_z_threshold,
     )
+    
+    # ======= Estado dos jogadores principais por posição (cards) =======
+    if "chosen_main_by_pos" not in st.session_state:
+        st.session_state["chosen_main_by_pos"] = {"QB": None, "RB": None, "WR": None, "TE": None}
+
+    # ========= Escolha do jogador principal por posição (cards) =========
+    st.markdown("#### 🔍 Focar jogador por posição (opcional)")
+    def _options_for(pos: str):
+        opts = ["(auto)"] + sorted(result_df.loc[result_df["POS"] == pos, "Player"].dropna().unique().tolist())
+        cur = st.session_state["chosen_main_by_pos"].get(pos)
+        idx = opts.index(cur) if cur in opts else 0
+        return opts, idx
+
+    sel_cols = st.columns(4)
+
+    with sel_cols[0]:
+        opts_qb, idx_qb = _options_for("QB")
+        sel_qb = st.selectbox("QB", opts_qb, index=idx_qb, key="sel_qb")
+        st.session_state["chosen_main_by_pos"]["QB"] = None if sel_qb == "(auto)" else sel_qb
+
+    with sel_cols[1]:
+        opts_rb, idx_rb = _options_for("RB")
+        sel_rb = st.selectbox("RB", opts_rb, index=idx_rb, key="sel_rb")
+        st.session_state["chosen_main_by_pos"]["RB"] = None if sel_rb == "(auto)" else sel_rb
+
+    with sel_cols[2]:
+        opts_wr, idx_wr = _options_for("WR")
+        sel_wr = st.selectbox("WR", opts_wr, index=idx_wr, key="sel_wr")
+        st.session_state["chosen_main_by_pos"]["WR"] = None if sel_wr == "(auto)" else sel_wr
+
+    with sel_cols[3]:
+        opts_te, idx_te = _options_for("TE")
+        sel_te = st.selectbox("TE", opts_te, index=idx_te, key="sel_te")
+        st.session_state["chosen_main_by_pos"]["TE"] = None if sel_te == "(auto)" else sel_te
+
+    # Usa sempre o estado para montar os cards
+    chosen_QB = st.session_state["chosen_main_by_pos"]["QB"]
+    chosen_RB = st.session_state["chosen_main_by_pos"]["RB"]
+    chosen_WR = st.session_state["chosen_main_by_pos"]["WR"]
+    chosen_TE = st.session_state["chosen_main_by_pos"]["TE"]
 
     # ==== Cards de custo por posição ====
-    cards = {p: compute_card_for_pos(result_df, p) for p in ["QB","RB","WR","TE"]}
+    cards = {
+        "QB": compute_card_for_pos(result_df, "QB", chosen_QB),
+        "RB": compute_card_for_pos(result_df, "RB", chosen_RB),
+        "WR": compute_card_for_pos(result_df, "WR", chosen_WR),
+        "TE": compute_card_for_pos(result_df, "TE", chosen_TE),
+    }
     render_cards(cards)
 
     # ==== Tabela com seleção direta ====
     st.markdown("**Tabela de probabilidades (vivos):**")
 
     filtered_df = result_df.copy()
+    # Reusa o filtro de posições da coluna da esquerda (busca)
     if pos_filter:
         filtered_df = filtered_df[filtered_df["POS"].isin(pos_filter)]
 
@@ -534,7 +609,8 @@ with col_info:
             disabled=["Player", "POS", "ADP", "imprev", "ADP_adj", "caos", "Prob próximo pick (%)"],
         )
 
-        col_tbl_btn1, col_tbl_btn2 = st.columns([1, 1])
+        col_tbl_btn1, col_tbl_btn2, col_tbl_btn3 = st.columns([1, 1, 1])
+
         if col_tbl_btn1.button("✅ Draftar selecionado (tabela)"):
             sel_rows = edited[edited["Selecionar"] == True] if isinstance(edited, pd.DataFrame) else pd.DataFrame()
             if not sel_rows.empty:
@@ -574,6 +650,21 @@ with col_info:
                     draft.history.pop()
                 st.rerun()
 
+        # >>> NOVO BOTÃO: definir como principal do card <<<
+        if col_tbl_btn3.button("⭐ Definir como principal do card"):
+            sel_rows = edited[edited["Selecionar"] == True] if isinstance(edited, pd.DataFrame) else pd.DataFrame()
+            if not sel_rows.empty:
+                pid = sel_rows.index[0]
+                row = players_df.loc[players_df["player_id"] == pid].iloc[0]
+                pos_sel = str(row["POS"])
+                name_sel = str(row["Player"])
+                if "chosen_main_by_pos" not in st.session_state:
+                    st.session_state["chosen_main_by_pos"] = {"QB": None, "RB": None, "WR": None, "TE": None}
+                # atualiza o principal da posição
+                if pos_sel in st.session_state["chosen_main_by_pos"]:
+                    st.session_state["chosen_main_by_pos"][pos_sel] = name_sel
+                st.rerun()
+
 # ---------- Board (Times x Rounds) ----------
 st.markdown("---")
 st.subheader("📋 Board (Times x Rounds)")
@@ -582,9 +673,9 @@ max_picks = max(draft.current_pick - 1, 0)
 rounds_completed = ((max_picks) // draft.N) + (1 if (max_picks % draft.N) else 0)
 rounds_to_show = max(8, rounds_completed + 1)
 
-cols = st.columns(int(draft.N))
+cols_board = st.columns(int(draft.N))
 for i in range(int(draft.N)):
-    with cols[i]:
+    with cols_board[i]:
         st.markdown(f"**Time {i+1}**")
         team_players = draft.teams[i].players
         for r in range(rounds_to_show):
