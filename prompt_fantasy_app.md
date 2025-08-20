@@ -146,15 +146,39 @@
 
 ---
 
-## ✅ Estado Atual (atualizado)
-- O app:
-  1. Lê o CSV via **GitHub (raw)** ou upload do usuário.
-  2. Limpa e converte os dados, incluindo criação automática de `Tier`.
-  3. Calcula métricas de ADP, probabilidade e FPTS corretamente.
-  4. Mostra **cards no estilo Panini/supertrunfo** para QB, RB, WR, TE.
-  5. Permite **selecionar manualmente o jogador principal** em cada posição.
-  6. Define o “Próximo” como o **primeiro por ADP com `P(sobrar) ≥ 50%`** (fallback = ADP mínimo).
-  7. Calcula corretamente o **Risco Missing Tier**.
-  8. Exibe tabela reorganizada com `Tier` e `FPTS` após `POS`, e `Prob% + Selecionar` após `ADP`.
-  9. Funciona em **deploy com GitHub**, sem necessidade de ajustes locais.
+###  10. 🔗 Integração com Sleeper (em andamento)
+
+### Objetivo
+- Sincronizar o draft local com o draft em andamento no **Sleeper**, de forma que:
+  - Jogadores draftados no Sleeper sejam automaticamente marcados como `picked` no app.
+  - O `draft.history` e o `draft.current_pick` sejam atualizados em tempo quase real.
+  - O **Draft Board** reflita exatamente o board oficial do Sleeper (rounds, slots, times).
+
+### Abordagem Técnica
+- Usar API pública do Sleeper (`/user`, `/league`, `/draft`, `/draft/<id>/picks`).
+- Resolver `draft_id` a partir de: input direto > league_id > username.
+- Baixar o dicionário `/players/nfl` 1x/dia (cache) para mapear nomes → IDs locais.
+- Sincronização por **polling leve** (3–5s) com `st.autorefresh` opcional.
+- Reconciliação por nome/posição/time com fallback manual (painel de “não mapeados”).
+
+### Plano de Implementação (blocos incrementais)
+1. **Sidebar Sleeper**: toggle, campos (username, league_id, draft_id, season, poll_sec).  
+2. **Helpers API**: funções `sleeper_*` (com cache e timeout).  
+3. **Resolver Draft ID**: lógica para priorizar entradas e cachear.  
+4. **Sync picks**: refletir picks no `players_df` e `draft.history`.  
+5. **Manual control & backoff**: pausar sync se a rede cair, evitar timeouts.  
+6. **Board oficial Sleeper**: reconstruir grid com dados reais de rounds/slots.  
+7. **Mapeamento manual**: painel para resolver nomes não encontrados.  
+8. **Status & Logs**: expander com últimas atualizações, export/import de estado.  
+9. **Autorefresh opcional**: atualização automática, controlada pelo usuário.  
+10. **Integração com Cards/Tabela**: reaproveitar `players_df` atualizado, sem precisar mudar lógica já existente.
+
+### Roadmap extra
+- Botão “Tomar controle manual”.  
+- Conflitos → reset e reconstrução pelo Sleeper.  
+- Export/Import de estado (`.json`).  
+- Logs de picks não reconhecidos + UI de mapeamento.  
+
+---
+
 
