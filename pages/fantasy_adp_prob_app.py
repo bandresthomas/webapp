@@ -396,7 +396,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Dados")
-    default_path = r"C:\Users\Thomas\Desktop\webapp\tables\adp_app_table.csv"
+    default_path = "https://raw.githubusercontent.com/bandresthomas/webapp/main/tables/adp_app_table.csv"
     st.caption(f"Caminho padrão: {default_path}")
     uploaded = st.file_uploader("Ou envie o CSV aqui", type=["csv"])  # opcional
 
